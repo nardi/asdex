@@ -2,7 +2,11 @@
 
 import itertools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass, field
+from typing import Any, cast, overload
+from typing import Self as Self
 
 import numpy as np
 from jax._src.core import Jaxpr, JaxprEqn, Literal, Var
@@ -26,18 +30,272 @@ def _singleton_index_set(i: int) -> IndexSet:
     return {i}
 
 
-def _empty_index_sets(n: int) -> list[IndexSet]:
-    """Create n empty dependency sets."""
-    return [_empty_index_set() for _ in range(n)]
+IndexArray = np.ndarray  # 1-D np.ndarray of flat dependency indices
 
 
-def _identity_index_sets(n: int) -> list[IndexSet]:
-    """Create identity sets where element i depends on index i."""
-    return [_singleton_index_set(i) for i in range(n)]
+class IndexSetView(AbstractSet[int]):
+    """Read-only, set-like view over one element's dependency indices.
+
+    Wraps a slice of a :class:`MultiIndexSet`'s backing array without
+    copying, so handlers can read a single element's dependencies and
+    combine them with set algebra (``|``, ``&``, ``in``, iteration)
+    without materializing a ``set``.
+
+    The view is immutable; callers must never try to mutate it.
+    Use :meth:`copy` to obtain a fresh, mutable ``set`` when in-place
+    mutation is needed.
+    """
+
+    __slots__ = ("_arr",)
+
+    def __init__(self, arr: IndexArray) -> None:
+        self._arr = arr
+
+    def __iter__(self) -> Iterator[int]:
+        # Iterating a Python list of the (small) row is faster than boxing
+        # numpy scalars one at a time, and yields plain ``int``.
+        return iter(self._arr.tolist())
+
+    def __len__(self) -> int:
+        return int(self._arr.size)
+
+    def __contains__(self, value: object) -> bool:
+        return value in self._arr
+
+    @classmethod
+    def _from_iterable(cls, it: Iterable[int]) -> set[int]:
+        # The AbstractSet mixin operators (|, &, -, ^) build their results
+        # through this hook; return a plain, mutable set rather than a view.
+        return set(it)
+
+    def copy(self) -> set[int]:
+        """Return a fresh, mutable ``set`` of these dependency indices."""
+        return set(self._arr.tolist())
 
 
-StateIndices = dict[Var, list[IndexSet]]
-"""Maps each variable to its per-element dependency index sets."""
+@dataclass(slots=True, kw_only=True, frozen=True, eq=False)
+class MultiIndexSet(Sequence[IndexSetView]):
+    """Per-element dependency sets stored in a compact CSR-like layout.
+
+    ``_indices`` is a flat array holding every dependency index,
+    grouped by element, and ``_row_offsets[i] : _row_offsets[i + 1]``
+    is the slice of ``_indices`` belonging to element ``i``.
+
+    Building this in bulk (via :class:`MultiIndexSetBuilder` or the
+    ``from_*`` constructors) is far cheaper than a ``list[set[int]]``,
+    which is why detection stores index sets this way.
+    Reading a single element (``mis[i]``) returns a read-only
+    :class:`IndexSetView` over that row so handlers can use ordinary set
+    algebra without materializing a ``set``.
+    """
+
+    _indices: IndexArray
+    _row_offsets: IndexArray
+
+    @classmethod
+    def from_labeled_indices(cls, length: int, labeled_indices: np.ndarray) -> Self:
+        """Build from a ``(2, k)`` array of ``(element, dependency)`` columns.
+
+        Columns may appear in any order and ``(element, dependency)`` pairs
+        may repeat; duplicates are dropped so each element's stored row is a
+        genuine set, sorted and contiguous in ``_indices``.
+        """
+        labels = np.asarray(labeled_indices[0], dtype=np.int_)
+        deps = np.asarray(labeled_indices[1], dtype=np.int_)
+
+        # Deduplicate and lexicographically sort the (element, dependency)
+        # pairs. This groups dependencies by element (so each row is a
+        # contiguous slice), sorts within each row, and collapses the
+        # duplicate pairs that accumulate through builder unions — without
+        # which repeated dependencies would leak into the COO output.
+        unique = np.unique(np.stack([labels, deps]), axis=1)
+        unique_labels = unique[0]
+        indices = unique[1]
+
+        # Row offsets are the running total of per-element dependency counts.
+        counts = np.bincount(unique_labels, minlength=length)
+        row_offsets = np.zeros(length + 1, dtype=np.int_)
+        np.cumsum(counts, out=row_offsets[1:])
+
+        return cls(_indices=indices, _row_offsets=row_offsets)
+
+    @classmethod
+    def from_list(cls, index_set_list: Sequence[Iterable[int]]) -> Self:
+        """Build from a per-element sequence of dependency iterables."""
+
+        def asarray(iter):
+            return (
+                np.fromiter(iter, int, len(iter))
+                if not isinstance(iter, np.ndarray)
+                else iter
+            )
+
+        labeled_indices = (
+            np.concatenate(
+                [
+                    np.stack(
+                        [
+                            indices := asarray(s),
+                            np.full_like(indices, i),
+                        ][::-1],
+                        axis=0,
+                    )
+                    for i, s in enumerate(index_set_list)
+                ],
+                axis=-1,
+            )
+            if len(index_set_list)
+            else np.empty((2, 0), dtype=np.int_)
+        )
+        return cls.from_labeled_indices(len(index_set_list), labeled_indices)
+
+    def __len__(self) -> int:
+        return self._row_offsets.size - 1
+
+    @overload
+    def __getitem__(self, index: int) -> IndexSetView: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[IndexSetView]: ...
+
+    def __getitem__(self, index: int | slice) -> IndexSetView | Sequence[IndexSetView]:
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+
+        start = self._row_offsets[index]
+        stop = self._row_offsets[index + 1]
+        return IndexSetView(self._indices[start:stop])
+
+    def __add__(self, other: "MultiIndexSet") -> "MultiIndexSet":
+        """Row-concatenate two patterns, merging their backing arrays.
+
+        The result has ``len(self) + len(other)`` rows: ``self``'s rows
+        followed by ``other``'s. ``other``'s dependency slice is appended
+        to ``_indices`` and its offsets are shifted past ``self``'s, so no
+        rows are unioned and each stays deduplicated.
+        """
+        if not isinstance(other, MultiIndexSet):
+            return NotImplemented
+        indices = np.concatenate([self._indices, other._indices])
+        row_offsets = np.concatenate(
+            [self._row_offsets, other._row_offsets[1:] + self._row_offsets[-1]]
+        )
+        return MultiIndexSet(_indices=indices, _row_offsets=row_offsets)
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class MultiIndexSetBuilder:
+    """Mutable accumulator that builds a :class:`MultiIndexSet` in bulk.
+
+    Supports the union-into-place idiom used by reductions and contractions::
+
+        out = MultiIndexSetBuilder(length=n)
+        out[i] |= deps      # record that element i depends on ``deps``
+        out[j] = deps       # equivalent; also records dependencies
+
+    Each write appends a batch of ``(element, dependency)`` pairs to
+    ``_index_arrays``; :meth:`build` concatenates them into one CSR array.
+    Assignment records dependencies rather than replacing them, matching
+    the append-only nature of the builder.
+    """
+
+    length: int
+    _index_arrays: list[IndexArray] = field(default_factory=list)
+
+    @classmethod
+    def identity(cls, *, length: int, offset: int = 0) -> Self:
+        """Builder where element ``i`` depends on the single index ``i + offset``."""
+        return cls(
+            length=length,
+            _index_arrays=[
+                np.stack([np.arange(length), np.arange(length) + offset], axis=0)
+            ],
+        )
+
+    def __len__(self) -> int:
+        return self.length
+
+    def build(self) -> MultiIndexSet:
+        labeled_indices = (
+            np.concatenate(self._index_arrays, axis=-1)
+            if self._index_arrays
+            else np.empty((2, 0), dtype=np.int_)
+        )
+        return MultiIndexSet.from_labeled_indices(self.length, labeled_indices)
+
+    def __getitem__(self, index: int | slice) -> "MultiIndexSetBuilderIndexer":
+        if isinstance(index, slice):
+            raise NotImplementedError("Indexing with slice not supported")
+
+        return MultiIndexSetBuilderIndexer(
+            _index_arrays=self._index_arrays, _index=index
+        )
+
+    def __setitem__(self, index: int, value: Any) -> None:
+        # `builder[i] |= deps` desugars to
+        # `builder[i] = builder[i].__ior__(deps)`. The indexer has already
+        # appended the pairs, so writing the same indexer back is a no-op.
+        if (
+            isinstance(value, MultiIndexSetBuilderIndexer)
+            and value._index == index
+            and value._index_arrays is self._index_arrays
+        ):
+            return
+
+        # Plain `builder[i] = deps`: record the dependencies for element i.
+        self[index].__ior__(cast(Iterable[int], value))
+
+
+@dataclass(slots=True, kw_only=True, frozen=True)
+class MultiIndexSetBuilderIndexer:
+    """Handle for a single element of a :class:`MultiIndexSetBuilder`.
+
+    Only supports ``|=`` (append this element's dependencies).
+    """
+
+    _index_arrays: list[IndexArray]
+    _index: int
+
+    def __ior__(self, it: Iterable[int]) -> Self:
+        indices = np.fromiter(it, dtype=np.int_)
+        labeled_indices = np.stack(
+            [np.full_like(indices, self._index), indices], axis=0
+        )
+        self._index_arrays.append(labeled_indices)
+        return self
+
+
+def _empty_index_sets(n: int) -> MultiIndexSetBuilder:
+    """Create a builder for n empty dependency sets."""
+    return MultiIndexSetBuilder(length=n)
+
+
+def _identity_index_sets(n: int) -> MultiIndexSetBuilder:
+    """Create an index set builder where element i depends on index i."""
+    return MultiIndexSetBuilder.identity(length=n)
+
+
+class StateIndices(dict[Var, MultiIndexSet]):
+    """Maps each variable to its per-element dependency index sets.
+
+    Accepts a :class:`MultiIndexSet`, a :class:`MultiIndexSetBuilder`
+    (built on assignment), or a plain per-element sequence of dependency
+    sets (converted via :meth:`MultiIndexSet.from_list`), so handlers can
+    produce whichever form is most convenient.
+    """
+
+    def __setitem__(
+        self,
+        key: Var,
+        value: MultiIndexSet | MultiIndexSetBuilder | Sequence[AbstractSet[int]],
+    ) -> None:
+        if isinstance(value, MultiIndexSetBuilder):
+            value = value.build()
+        elif not isinstance(value, MultiIndexSet):
+            value = MultiIndexSet.from_list(value)
+
+        super().__setitem__(key, value)
+
 
 StateConsts = dict[Var, np.ndarray]
 """Maps variables to their concrete numpy array values (for static index tracking)."""
@@ -55,9 +313,14 @@ Atom = Var | Literal
 """Atomic elements in jaxpressions: named intermediates (Var) or constants (Literal)."""
 
 PropJaxprFn = Callable[
-    [Jaxpr, list[list[IndexSet]], StateConsts | None], list[list[IndexSet]]
+    [Jaxpr, Sequence[Sequence[AbstractSet[int]]], StateConsts | None],
+    list[MultiIndexSet],
 ]
-"""Signature of ``_prop_jaxpr``, passed as callback to break circular imports."""
+"""Signature of ``_prop_jaxpr``, passed as callback to break circular imports.
+
+Inputs are per-variable index sets: a :class:`MultiIndexSet` or any plain
+per-element sequence of sets. Outputs are always :class:`MultiIndexSet`.
+"""
 
 
 _MAX_ENUM_COMBINATIONS = 64
@@ -84,8 +347,8 @@ or two indices each with up to 8 possible values).
 def _enumerate_bounded_patterns(
     ranges: Sequence[range],
     out_size: int,
-    make_pattern: Callable[[tuple[int, ...]], list[IndexSet] | None],
-) -> list[IndexSet] | None:
+    make_pattern: Callable[[tuple[int, ...]], Sequence[AbstractSet[int]] | None],
+) -> list[AbstractSet[int]] | None:
     """Enumerate all candidate index combinations and union the resulting patterns.
 
     Used by ``gather``, ``scatter``, ``dynamic_slice``, and ``dynamic_update_slice``
@@ -101,13 +364,13 @@ def _enumerate_bounded_patterns(
     if math.prod(len(r) for r in ranges) > _MAX_ENUM_COMBINATIONS:
         return None
 
-    accumulated: list[IndexSet] | None = None
+    accumulated: list[AbstractSet[int]] | None = None
     for candidate_values in itertools.product(*ranges):
         pattern = make_pattern(candidate_values)
         if pattern is None:
             return None
         if accumulated is None:
-            accumulated = pattern
+            accumulated = list(pattern)
         else:
             for i in range(out_size):
                 accumulated[i] = accumulated[i] | pattern[i]
@@ -142,16 +405,16 @@ def _atom_numel(atom: Atom) -> int:
 # Atom value access
 
 
-def _index_sets(state_indices: StateIndices, atom: Atom) -> list[IndexSet]:
+def _index_sets(state_indices: StateIndices, atom: Atom) -> MultiIndexSet:
     """Get the index sets for a variable or literal."""
     if isinstance(atom, Literal):
-        return _empty_index_sets(_atom_numel(atom))
-    return state_indices.get(atom, [_empty_index_set()])
+        return _empty_index_sets(_atom_numel(atom)).build()
+    return state_indices.get(atom, MultiIndexSetBuilder(length=1).build())
 
 
-def _copy_index_sets(src: list[IndexSet]) -> list[IndexSet]:
-    """Deep-copy a list of index sets."""
-    return [s.copy() for s in src]
+def _copy_index_sets(src: Sequence[AbstractSet[int]]) -> list[IndexSet]:
+    """Copy per-element index sets into a fresh, mutable ``list[set]``."""
+    return [set(s) for s in src]
 
 
 def _atom_const_val(atom: Atom, state_consts: StateConsts) -> np.ndarray | None:
@@ -260,27 +523,28 @@ def _clear_where_zero(
     in_shape = _atom_shape(eqn.invars[invar_idx])
     flat = _broadcast_to_output(val, in_shape, out_shape)
 
+    # Rebuild the output, dropping dependencies where the input is a known zero.
     out_indices = state_indices[eqn.outvars[0]]
-    for i in range(len(out_indices)):
-        if flat[i] == 0:
-            out_indices[i] = _empty_index_set()
+    state_indices[eqn.outvars[0]] = [
+        _empty_index_set() if flat[i] == 0 else out_indices[i]
+        for i in range(len(out_indices))
+    ]
 
 
 # Index set operations
 
 
-def _union_all(sets: Sequence[IndexSet]) -> IndexSet:
+def _union_all(sets: Sequence[AbstractSet[int]]) -> IndexSet:
     """Union all sets together, returning a new set."""
-    if not sets:
-        return _empty_index_set()
     result: IndexSet = _empty_index_set()
     for s in sets:
-        result |= s
+        # ``update`` (not ``|=``) so set-like views are accepted as operands.
+        result.update(s)
     return result
 
 
 def _union_elementwise(
-    inputs: Sequence[list[IndexSet]], out_size: int
+    inputs: Sequence[Sequence[AbstractSet[int]]], out_size: int
 ) -> list[IndexSet]:
     """Union multiple index set lists element-wise with scalar broadcasting.
 
@@ -313,7 +577,9 @@ def _check_no_index_sets(
         raise ValueError(msg)
 
 
-def _conservative_indices(all_indices: list[IndexSet], out_size: int) -> list[IndexSet]:
+def _conservative_indices(
+    all_indices: Sequence[AbstractSet[int]], out_size: int
+) -> list[IndexSet]:
     """Build conservative output index sets where every element depends on the union of all inputs."""
     combined = _union_all(all_indices)
     return [combined] * out_size
@@ -351,8 +617,8 @@ def _position_map(shape: Sequence[int]) -> np.ndarray:
 
 
 def _permute_indices(
-    in_indices: list[IndexSet], flat_map: Sequence[int] | np.ndarray
-) -> list[IndexSet]:
+    in_indices: Sequence[IndexSetView], flat_map: Sequence[int] | np.ndarray
+) -> list[IndexSetView]:
     """Build output index sets by looking up input positions from a flat map.
 
     Each output element copies its index set from ``in_indices[flat_map[i]]``.
@@ -363,10 +629,10 @@ def _permute_indices(
 
 
 def _transform_indices(
-    in_indices: list[IndexSet],
+    in_indices: Sequence[IndexSetView],
     in_shape: Sequence[int],
     transform: Callable[[np.ndarray], np.ndarray] = lambda p: p,
-) -> list[IndexSet]:
+) -> list[IndexSetView]:
     """Build output index sets by transforming a position map.
 
     Creates a position map for ``in_shape``

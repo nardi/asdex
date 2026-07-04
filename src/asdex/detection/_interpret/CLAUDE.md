@@ -15,24 +15,36 @@ through primitives to determine Jacobian sparsity patterns.
 ## Key Types
 
 - `IndexSet` = `set[int]` — a single per-element dependency set
-- `list[IndexSet]` — per-element dependency sets for one array
-- `StateIndices` = `dict[Var, list[IndexSet]]` — maps jaxpr variables to their index sets
+- `MultiIndexSet` — per-element dependency sets for one array, stored in a
+  compact CSR-like layout (a flat index array plus row offsets).
+  This is the stored form; it is much cheaper to build in bulk than a
+  `list[set[int]]`. Reading one element (`mis[i]`) returns a read-only
+  `IndexSetView` (set-like, no copy); slicing/iterating yields those views.
+  It is immutable — never mutate an element in place.
+- `MultiIndexSetBuilder` — mutable accumulator for building a `MultiIndexSet`.
+  Supports `builder[i] |= deps` (and `builder[i] = deps`) to record
+  dependencies per element; call `.build()` to freeze into a `MultiIndexSet`.
+  Handlers that aggregate (reduce, dot_general, sort) build with this.
+- `StateIndices` = `dict[Var, MultiIndexSet]` — maps jaxpr variables to their
+  index sets. Assigning a `MultiIndexSetBuilder`, a `MultiIndexSet`, or a plain
+  `list[IndexSet]` all work; the value is normalized to a `MultiIndexSet`.
 - `StateConsts` = `dict[Var, np.ndarray]` — statically-known values for precise gather/scatter
 - `StateBounds` = `dict[Var, tuple[np.ndarray, np.ndarray]]` — per-element inclusive (lo, hi) integer bounds
 
 ## Naming Conventions
 
 **Terminology** — "indices" and "map" mean different things:
-- **"indices" / "index sets"**: `list[IndexSet]`,
-  the per-element dependency sets used for sparsity tracking.
+- **"indices" / "index sets"**: the per-element dependency sets used for
+  sparsity tracking (a `MultiIndexSet`, or a plain `list[IndexSet]` while
+  a handler is building one).
 - **"map"**: numpy integer arrays that map output positions to input positions.
   Not index sets.
 
 **Construction** — always use the factory helpers from `_common`:
 - `_empty_index_set()` instead of `set()`
 - `_singleton_index_set(i)` instead of `{i}`
-- `_empty_index_sets(n)` instead of `[set() for _ in range(n)]`
-- `_identity_index_sets(n)` instead of `[{i} for i in range(n)]`
+- `_empty_index_sets(n)` — a `MultiIndexSetBuilder` of `n` empty sets
+- `_identity_index_sets(n)` — a `MultiIndexSetBuilder` where element `i` depends on `i`
 
 This ensures a future backend swap only requires changing the helpers,
 not every handler.
@@ -85,14 +97,28 @@ not every handler.
 
 ## Index Set Aliasing
 
-Index sets in `StateIndices` are **shared, not copied**.
-Multiple output elements may reference the same `set[int]` object,
-and output sets may alias input sets.
+A `MultiIndexSet` is **immutable**, and reading an element returns a read-only
+`IndexSetView` over its backing array (no copy).
 Handlers must therefore **never mutate** a set obtained from `state_indices` or `_index_sets()`.
-Always build new sets (via `_union_all`, `|`, or the factory helpers) instead of mutating in place.
 
-The one exception is `_fixed_point_loop` in `_while.py`,
-which explicitly copies carry sets before mutating them via `|=`.
+To combine index sets, build new ones:
+- `s1 | s2` and `_union_all(...)` return fresh `set[int]`s.
+- To accumulate into a plain set, use `acc.update(s)` — **not** `acc |= s`,
+  since a view is not a `set` and `|=` requires a `set` operand.
+- Call `view.copy()` to get a fresh, mutable `set` when you need to mutate.
+- To build per-element output in bulk, use a `MultiIndexSetBuilder`
+  (`out[i] |= deps`) and store it; `StateIndices` builds it on assignment.
+- `mis_a + mis_b` row-concatenates two `MultiIndexSet`s into a new one
+  (merging their backing arrays), e.g. to pool two operands before a
+  conservative union.
+
+`_prop_while` copies carry rows into fresh mutable sets before the
+fixed-point loop mutates them across iterations.
+
+Read-only reads are typed `IndexSetView`; freshly built/mutable sets are
+`set[int]` (aliased `IndexSet`). Use `AbstractSet[int]` for parameters that
+accept either. Only genuinely-mutable accumulators should be typed
+`list[IndexSet]`.
 
 ## Const Value Tracking
 
