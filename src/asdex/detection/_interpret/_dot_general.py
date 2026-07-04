@@ -4,13 +4,11 @@ import numpy as np
 from jax._src.core import JaxprEqn
 
 from ._common import (
-    IndexSet,
     MultiIndexSetBuilder,
     StateConsts,
     StateIndices,
     _atom_const_val,
     _atom_shape,
-    _empty_index_set,
     _empty_index_sets,
     _index_sets,
 )
@@ -91,15 +89,16 @@ def _prop_dot_general(
     if not out_shape:
         # Scalar output (e.g., vector dot product).
         # Skip terms where either factor is a known zero.
-        result: IndexSet = _empty_index_set()
-        for i in range(len(lhs_indices)):
-            lhs_zero = lhs_val_flat is not None and lhs_val_flat[i] == 0
-            rhs_zero = rhs_val_flat is not None and rhs_val_flat[i] == 0
-            if lhs_zero or rhs_zero:
-                continue
-            result.update(lhs_indices[i])
-            result.update(rhs_indices[i])
-        state_indices[eqn.outvars[0]] = [result]
+        skip = np.zeros(len(lhs_indices), dtype=bool)
+        if lhs_val_flat is not None:
+            skip |= lhs_val_flat == 0
+        if rhs_val_flat is not None:
+            skip |= rhs_val_flat == 0
+        union_indices = np.nonzero(~skip)[0]
+        result = MultiIndexSetBuilder(length=1)
+        result[0] |= lhs_indices[union_indices].indices
+        result[0] |= rhs_indices[union_indices].indices
+        state_indices[eqn.outvars[0]] = result
         return
 
     n_batch = len(lhs_batch)
@@ -132,6 +131,10 @@ def _prop_dot_general(
 
     out_indices: MultiIndexSetBuilder = _empty_index_sets(out_size)
 
+    # This array is used to mark indices where one of the operands has a zero.
+    # It may be reused multiple times.
+    skip = np.empty(out_size, dtype=bool)
+
     for c_idx in range(n_contract):
         lhs_coord = tuple(
             lhs_fixed[d]
@@ -156,14 +159,18 @@ def _prop_dot_general(
             np.ravel_multi_index(rhs_coord, rhs_shape), out_shape
         ).ravel()
 
-        for o in range(out_size):
-            # Skip this contraction term if either factor is a known zero,
-            # since the product contributes nothing to the derivative.
-            lhs_zero = lhs_val_flat is not None and lhs_val_flat[lhs_flat[o]] == 0
-            rhs_zero = rhs_val_flat is not None and rhs_val_flat[rhs_flat[o]] == 0
-            if lhs_zero or rhs_zero:
-                continue
-            out_indices[o] |= lhs_indices[lhs_flat[o]]
-            out_indices[o] |= rhs_indices[rhs_flat[o]]
+        # Skip any elements for which one of the input operands is a known zero.
+        skip[:] = False
+        if lhs_val_flat is not None:
+            skip |= lhs_val_flat[lhs_flat] == 0
+        if rhs_val_flat is not None:
+            skip |= rhs_val_flat[lhs_flat] == 0
+
+        # These are the (possibly) nonzero indices for which we should collect
+        # the dependencies.
+        union_indices = np.nonzero(~skip)[0]
+
+        out_indices[union_indices] = lhs_indices[lhs_flat[union_indices]]
+        out_indices[union_indices] = rhs_indices[rhs_flat[union_indices]]
 
     state_indices[eqn.outvars[0]] = out_indices
