@@ -89,7 +89,7 @@ class MultiIndexSet(Sequence[IndexSetView]):
     algebra without materializing a ``set``.
     """
 
-    _indices: IndexArray
+    indices: IndexArray
     _row_offsets: IndexArray
 
     @classmethod
@@ -117,7 +117,7 @@ class MultiIndexSet(Sequence[IndexSetView]):
         row_offsets = np.zeros(length + 1, dtype=np.int_)
         np.cumsum(counts, out=row_offsets[1:])
 
-        return cls(_indices=indices, _row_offsets=row_offsets)
+        return cls(indices=indices, _row_offsets=row_offsets)
 
     @classmethod
     def from_list(cls, index_set_list: Sequence[Iterable[int]]) -> Self:
@@ -156,15 +156,34 @@ class MultiIndexSet(Sequence[IndexSetView]):
     def __getitem__(self, index: int) -> IndexSetView: ...
 
     @overload
-    def __getitem__(self, index: slice) -> Sequence[IndexSetView]: ...
+    def __getitem__(self, index: slice | np.ndarray) -> "MultiIndexSet": ...
 
-    def __getitem__(self, index: int | slice) -> IndexSetView | Sequence[IndexSetView]:
+    def __getitem__(
+        self, index: int | slice | np.ndarray
+    ) -> "IndexSetView | MultiIndexSet":
         if isinstance(index, slice):
-            return [self[i] for i in range(*index.indices(len(self)))]
+            index = np.arange(*index.indices(len(self)))
+
+        if isinstance(index, np.ndarray):
+            # Select a subset of rows into a new MultiIndexSet.
+            starts = self._row_offsets[index]
+            stops = self._row_offsets[index + 1]
+            row_lengths = stops - starts
+            row_offsets = np.zeros(row_lengths.size + 1, dtype=np.int_)
+            np.cumsum(row_lengths, out=row_offsets[1:])
+
+            # Gather each selected row's contiguous slice into one flat array.
+            # For output position p in selected row k, the source index is
+            # ``starts[k] + (p - row_offsets[k])``; broadcast the per-row shift
+            # ``starts - row_offsets[:-1]`` across each row's positions.
+            shift = np.repeat(starts - row_offsets[:-1], row_lengths)
+            values = self.indices[np.arange(row_offsets[-1]) + shift]
+
+            return MultiIndexSet(indices=values, _row_offsets=row_offsets)
 
         start = self._row_offsets[index]
         stop = self._row_offsets[index + 1]
-        return IndexSetView(self._indices[start:stop])
+        return IndexSetView(self.indices[start:stop])
 
     def __add__(self, other: "MultiIndexSet") -> "MultiIndexSet":
         """Row-concatenate two patterns, merging their backing arrays.
@@ -176,11 +195,11 @@ class MultiIndexSet(Sequence[IndexSetView]):
         """
         if not isinstance(other, MultiIndexSet):
             return NotImplemented
-        indices = np.concatenate([self._indices, other._indices])
+        indices = np.concatenate([self.indices, other.indices])
         row_offsets = np.concatenate(
             [self._row_offsets, other._row_offsets[1:] + self._row_offsets[-1]]
         )
-        return MultiIndexSet(_indices=indices, _row_offsets=row_offsets)
+        return MultiIndexSet(indices=indices, _row_offsets=row_offsets)
 
     # Numba interop
 
@@ -193,14 +212,14 @@ class MultiIndexSet(Sequence[IndexSetView]):
         from ._numba import NumbaMultiIndexSet  # noqa: PLC0415
 
         return NumbaMultiIndexSet.create(
-            np.ascontiguousarray(self._indices, dtype=np.int64),
+            np.ascontiguousarray(self.indices, dtype=np.int64),
             np.ascontiguousarray(self._row_offsets, dtype=np.int64),
         )
 
     @classmethod
     def from_numba(cls, nb: Any) -> Self:
         """Rebuild a :class:`MultiIndexSet` from a :class:`NumbaMultiIndexSet`."""
-        return cls(_indices=nb.indices, _row_offsets=nb.row_offsets)
+        return cls(indices=nb.indices, _row_offsets=nb.row_offsets)
 
 
 @dataclass(slots=True, kw_only=True, frozen=True)
@@ -277,7 +296,13 @@ class MultiIndexSetBuilder:
             _index_arrays=self._index_arrays, _index=index
         )
 
-    def __setitem__(self, index: int, value: Any) -> None:
+    def __setitem__(self, index: int | np.ndarray, value: Any) -> None:
+        # `builder[array] = mis`: assign a whole batch of elements at once,
+        # equivalent to `for k: builder[array[k]] = mis[k]` but in one append.
+        if isinstance(index, np.ndarray):
+            self._setitem_batch(index, value)
+            return
+
         # `builder[i] |= deps` desugars to
         # `builder[i] = builder[i].__ior__(deps)`. The indexer has already
         # appended the pairs, so writing the same indexer back is a no-op.
@@ -291,6 +316,29 @@ class MultiIndexSetBuilder:
         # Plain `builder[i] = deps`: record the dependencies for element i.
         self[index].__ior__(cast(Iterable[int], value))
 
+    def _setitem_batch(self, index: np.ndarray, value: Any) -> None:
+        """Assign ``value[k]``'s dependencies to element ``index[k]`` for every k.
+
+        ``value`` is a :class:`MultiIndexSet` (or any per-element sequence,
+        converted via :meth:`MultiIndexSet.from_list`) whose length must match
+        ``index``. Records one labeled chunk covering all rows: since
+        ``_indices`` is grouped by row in order, repeating each target element
+        by its row length lines every dependency up with its destination.
+        """
+        mis = (
+            value
+            if isinstance(value, MultiIndexSet)
+            else MultiIndexSet.from_list(value)
+        )
+        if len(mis) != index.size:
+            raise ValueError(
+                f"Cannot assign {len(mis)} index sets to {index.size} elements; "
+                "the MultiIndexSet length must match the index array."
+            )
+        row_lengths = np.diff(mis._row_offsets)
+        labels = np.repeat(index, row_lengths)
+        self._index_arrays.append(np.stack([labels, mis.indices]))
+
 
 @dataclass(slots=True, kw_only=True, frozen=True)
 class MultiIndexSetBuilderIndexer:
@@ -303,7 +351,9 @@ class MultiIndexSetBuilderIndexer:
     _index: int
 
     def __ior__(self, it: Iterable[int]) -> Self:
-        indices = np.fromiter(it, dtype=np.int_)
+        indices = (
+            np.fromiter(it, dtype=np.int_) if not isinstance(it, np.ndarray) else it
+        )
         labeled_indices = np.stack(
             [np.full_like(indices, self._index), indices], axis=0
         )

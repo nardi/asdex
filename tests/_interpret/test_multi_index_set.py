@@ -76,11 +76,23 @@ def test_from_labeled_indices_empty():
     assert _rows(m) == [set(), set()]
 
 
-def test_getitem_slice_returns_rows():
-    """Slicing returns the per-element sets in that range."""
-    m = MultiIndexSet.from_list([{0}, {1}, {2}, {3}])
+def test_getitem_slice_returns_sub_multi_index_set():
+    """Slicing selects rows into a new MultiIndexSet."""
+    m = MultiIndexSet.from_list([{0}, {1, 5}, {2}, {3}])
     sliced = m[1:3]
-    assert [set(s) for s in sliced] == [{1}, {2}]
+    assert isinstance(sliced, MultiIndexSet)
+    assert _rows(sliced) == [{1, 5}, {2}]
+    assert _rows(m[::2]) == [{0}, {2}]
+
+
+def test_getitem_fancy_index_selects_rows():
+    """An integer array selects (and reorders/repeats) rows into a MultiIndexSet."""
+    m = MultiIndexSet.from_list([{0, 1}, set(), {2, 3, 4}, {5}])
+    picked = m[np.array([2, 0, 2])]
+    assert isinstance(picked, MultiIndexSet)
+    assert _rows(picked) == [{2, 3, 4}, {0, 1}, {2, 3, 4}]
+    # Empty selection yields a length-0 MultiIndexSet.
+    assert _rows(m[np.array([], dtype=np.int_)]) == []
 
 
 def test_getitem_returns_view():
@@ -178,6 +190,57 @@ def test_builder_ior_accepts_view():
     b = MultiIndexSetBuilder(length=1)
     b[0] |= IndexSetView(np.array([3, 4]))
     assert _rows(b.build()) == [{3, 4}]
+
+
+def test_builder_array_assign():
+    """``builder[array] = mis`` assigns mis[k] to element array[k]."""
+    b = MultiIndexSetBuilder(length=4)
+    b[np.array([2, 0])] = MultiIndexSet.from_list([{5}, {6, 7}])
+    assert _rows(b.build()) == [{6, 7}, set(), {5}, set()]
+
+
+def test_builder_array_assign_matches_scalar_loop():
+    """The batch assign equals the explicit per-element loop."""
+    targets = np.array([3, 1, 0])
+    mis = MultiIndexSet.from_list([{10, 11}, {12}, set()])
+
+    batch = MultiIndexSetBuilder(length=4)
+    batch[targets] = mis
+
+    loop = MultiIndexSetBuilder(length=4)
+    for k, t in enumerate(targets):
+        loop[int(t)] = mis[k]
+
+    assert _rows(batch.build()) == _rows(loop.build())
+
+
+def test_builder_array_assign_duplicate_targets_union():
+    """Repeated targets in the index array union their assigned sets."""
+    b = MultiIndexSetBuilder(length=2)
+    b[np.array([0, 0, 1])] = MultiIndexSet.from_list([{1}, {2, 3}, {4}])
+    assert _rows(b.build()) == [{1, 2, 3}, {4}]
+
+
+def test_builder_array_assign_interops_with_scalar():
+    """Batch assignment and scalar ``|=`` accumulate into the same builder."""
+    b = MultiIndexSetBuilder(length=3)
+    b[np.array([0, 2])] = MultiIndexSet.from_list([{1}, {5}])
+    b[0] |= {9}
+    assert _rows(b.build()) == [{1, 9}, set(), {5}]
+
+
+def test_builder_array_assign_empty():
+    """An empty index array is a no-op."""
+    b = MultiIndexSetBuilder(length=2)
+    b[np.array([], dtype=np.int_)] = MultiIndexSet.from_list([])
+    assert _rows(b.build()) == [set(), set()]
+
+
+def test_builder_array_assign_length_mismatch_raises():
+    """Assigning a MultiIndexSet whose length differs from the index array errors."""
+    b = MultiIndexSetBuilder(length=3)
+    with pytest.raises(ValueError, match="length must match"):
+        b[np.array([0, 1])] = MultiIndexSet.from_list([{1}])
 
 
 def test_builder_len():
