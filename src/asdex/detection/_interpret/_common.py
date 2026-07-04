@@ -182,6 +182,26 @@ class MultiIndexSet(Sequence[IndexSetView]):
         )
         return MultiIndexSet(_indices=indices, _row_offsets=row_offsets)
 
+    # Numba interop
+
+    def to_numba(self) -> Any:
+        """Return an njit-readable :class:`NumbaMultiIndexSet` over the same rows.
+
+        Backing arrays are made C-contiguous ``int64`` (copying only when
+        necessary) to satisfy the jitclass field types.
+        """
+        from ._numba import NumbaMultiIndexSet  # noqa: PLC0415
+
+        return NumbaMultiIndexSet.create(
+            np.ascontiguousarray(self._indices, dtype=np.int64),
+            np.ascontiguousarray(self._row_offsets, dtype=np.int64),
+        )
+
+    @classmethod
+    def from_numba(cls, nb: Any) -> Self:
+        """Rebuild a :class:`MultiIndexSet` from a :class:`NumbaMultiIndexSet`."""
+        return cls(_indices=nb.indices, _row_offsets=nb.row_offsets)
+
 
 @dataclass(slots=True, kw_only=True, frozen=True)
 class MultiIndexSetBuilder:
@@ -222,6 +242,32 @@ class MultiIndexSetBuilder:
             else np.empty((2, 0), dtype=np.int_)
         )
         return MultiIndexSet.from_labeled_indices(self.length, labeled_indices)
+
+    # Numba interop
+
+    def to_numba(self) -> Any:
+        """Return an njit-writable :class:`NumbaMultiIndexSetBuilder`.
+
+        Seeds it with the ``(label, dep)`` chunks accumulated so far;
+        further accumulation happens inside ``@njit`` code.
+        """
+        from ._numba import NumbaMultiIndexSetBuilder  # noqa: PLC0415
+
+        builder = NumbaMultiIndexSetBuilder.create(self.length)
+        for chunk in self._index_arrays:
+            builder.append_chunk(np.ascontiguousarray(chunk, dtype=np.int64))
+        return builder
+
+    @classmethod
+    def from_numba(cls, nb: Any) -> Self:
+        """Rebuild a Python builder from a :class:`NumbaMultiIndexSetBuilder`.
+
+        Call :meth:`build` on the result to dedup/sort into a
+        :class:`MultiIndexSet`.
+        """
+        builder = cls(length=int(nb.length))
+        builder._index_arrays.extend(np.asarray(chunk) for chunk in nb.chunks)
+        return builder
 
     def __getitem__(self, index: int | slice) -> "MultiIndexSetBuilderIndexer":
         if isinstance(index, slice):
